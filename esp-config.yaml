@@ -1,4 +1,3 @@
-```yaml
 substitutions:
   device_name: well_water_system
   friendly_name: "Well Water System"
