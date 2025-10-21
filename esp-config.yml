@@ -1,0 +1,518 @@
+```yaml
+substitutions:
+  device_name: well_water_system
+  friendly_name: "Well Water System"
+  
+esphome:
+  name: ${device_name}
+  platform: ESP32
+  board: esp32dev
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  
+  ap:
+    ssid: "${device_name} Fallback"
+    password: !secret ap_password
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  password: !secret ota_password
+
+web_server:
+  port: 80
+
+# I2C for ADS1115 pressure sensor ADC
+i2c:
+  sda: GPIO21
+  scl: GPIO22
+  scan: true
+  id: i2c_bus
+
+# 1-Wire for DS18B20 temperature sensors
+one_wire:
+  - platform: gpio
+    pin: GPIO22
+
+# ============================================
+# SENSORS
+# ============================================
+
+sensor:
+  # ------------------------------
+  # FLOW MONITORING
+  # ------------------------------
+  - platform: pulse_meter
+    pin: GPIO21
+    name: "${friendly_name} Flow Rate"
+    id: water_flow_rate
+    unit_of_measurement: "L/min"
+    device_class: water
+    state_class: measurement
+    icon: "mdi:water"
+    accuracy_decimals: 2
+    internal_filter: 100ms
+    timeout: 30s
+    filters:
+      # YF-B10: 660 pulses/liter
+      # L/min = (60 sec/min) / 660 pulses/L = 0.0909
+      - multiply: 0.0909
+      
+    total:
+      name: "${friendly_name} Total Volume"
+      id: water_total_liters
+      unit_of_measurement: "L"
+      device_class: water
+      state_class: total_increasing
+      accuracy_decimals: 1
+      icon: "mdi:gauge"
+
+  # Convert to cubic meters for Energy Dashboard
+  - platform: template
+    name: "${friendly_name} Total m³"
+    id: water_total_m3
+    unit_of_measurement: "m³"
+    device_class: water
+    state_class: total_increasing
+    accuracy_decimals: 3
+    lambda: return id(water_total_liters).state * 0.001;
+    update_interval: 60s
+    
+  # Convert to gallons
+  - platform: template
+    name: "${friendly_name} Total Gallons"
+    id: water_total_gallons
+    unit_of_measurement: "gal"
+    device_class: water
+    state_class: total_increasing
+    accuracy_decimals: 1
+    lambda: return id(water_total_liters).state * 0.264172;
+    update_interval: 60s
+
+  # ------------------------------
+  # PRESSURE MONITORING (via ADS1115)
+  # ------------------------------
+  - platform: ads1115
+    id: ads1115_hub
+    address: 0x48
+    
+  - platform: ads1115
+    name: "${friendly_name} Pump Output Pressure"
+    id: pump_output_pressure
+    ads1115_id: ads1115_hub
+    multiplexer: 'A0'
+    gain: 4.096
+    unit_of_measurement: "PSI"
+    device_class: pressure
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 2s
+    filters:
+      # Sensor: 0.5V = 0 PSI, 4.5V = 100 PSI
+      - calibrate_linear:
+          - 0.5 -> 0
+          - 4.5 -> 100
+      - sliding_window_moving_average:
+          window_size: 5
+          send_every: 1
+          
+  - platform: ads1115
+    name: "${friendly_name} System Pressure"
+    id: system_pressure
+    ads1115_id: ads1115_hub
+    multiplexer: 'A1'
+    gain: 4.096
+    unit_of_measurement: "PSI"
+    device_class: pressure
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 2s
+    filters:
+      - calibrate_linear:
+          - 0.5 -> 0
+          - 4.5 -> 100
+      - sliding_window_moving_average:
+          window_size: 5
+          send_every: 1
+          
+  - platform: ads1115
+    name: "${friendly_name} Filtered Pressure"
+    id: filter_outlet_pressure
+    ads1115_id: ads1115_hub
+    multiplexer: 'A2'
+    gain: 4.096
+    unit_of_measurement: "PSI"
+    device_class: pressure
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 2s
+    filters:
+      - calibrate_linear:
+          - 0.5 -> 0
+          - 4.5 -> 100
+      - sliding_window_moving_average:
+          window_size: 5
+          send_every: 1
+  
+  # Calculated filter pressure drop
+  - platform: template
+    name: "${friendly_name} Filter Pressure Drop"
+    id: filter_pressure_drop
+    unit_of_measurement: "PSI"
+    device_class: pressure
+    state_class: measurement
+    accuracy_decimals: 1
+    lambda: |-
+      return id(system_pressure).state - id(filter_outlet_pressure).state;
+    update_interval: 5s
+
+  # ------------------------------
+  # TEMPERATURE MONITORING
+  # ------------------------------
+  - platform: dallas_temp
+    address: 0x1c0000031edd2a28  # Replace with actual address from logs
+    name: "${friendly_name} Incoming Water Temp"
+    id: incoming_water_temp
+    unit_of_measurement: "°F"
+    accuracy_decimals: 1
+    filters:
+      - lambda: return x * (9.0/5.0) + 32.0;  # C to F
+      
+  - platform: dallas_temp
+    address: 0x1d0000031f0e5c28  # Replace with actual address from logs
+    name: "${friendly_name} Hot Water Temp"
+    id: hot_water_temp
+    unit_of_measurement: "°F"
+    accuracy_decimals: 1
+    filters:
+      - lambda: return x * (9.0/5.0) + 32.0;  # C to F
+      
+  # Water heater temperature rise
+  - platform: template
+    name: "${friendly_name} Heater Temp Rise"
+    id: temp_rise
+    unit_of_measurement: "°F"
+    accuracy_decimals: 1
+    lambda: |-
+      return id(hot_water_temp).state - id(incoming_water_temp).state;
+    update_interval: 30s
+
+  # ------------------------------
+  # WATER QUALITY MONITORING
+  # ------------------------------
+  - platform: adc
+    pin: GPIO34
+    name: "${friendly_name} TDS"
+    id: water_tds
+    attenuation: 11db
+    unit_of_measurement: "ppm"
+    accuracy_decimals: 0
+    update_interval: 10s
+    filters:
+      # Calibrate based on your specific TDS sensor
+      # Typical range: 0-3.3V = 0-1000ppm
+      - calibrate_linear:
+          - 0.0 -> 0
+          - 3.3 -> 1000
+      - sliding_window_moving_average:
+          window_size: 10
+          send_every: 1
+
+  - platform: adc
+    pin: GPIO35
+    name: "${friendly_name} pH"
+    id: water_ph
+    attenuation: 11db
+    unit_of_measurement: "pH"
+    accuracy_decimals: 1
+    update_interval: 10s
+    filters:
+      # Calibrate with pH 4.0 and 7.0 buffer solutions
+      # Measure voltage at each pH and update these values
+      - calibrate_linear:
+          - 0.5 -> 4.0
+          - 2.0 -> 7.0
+      - sliding_window_moving_average:
+          window_size: 10
+          send_every: 1
+
+  # ------------------------------
+  # PUMP MONITORING
+  # ------------------------------
+  - platform: ct_clamp
+    sensor: pump_adc_sensor
+    name: "${friendly_name} Pump Current"
+    id: pump_current
+    update_interval: 1s
+    filters:
+      # Calibrate for your pump's actual amperage
+      - calibrate_linear:
+          - 0 -> 0
+          - 0.5 -> 4.8  # Adjust based on pump rating
+    
+  - platform: adc
+    id: pump_adc_sensor
+    pin: GPIO33
+    attenuation: 11db
+    
+  # Pump cycle and runtime tracking
+  - platform: template
+    name: "${friendly_name} Pump Cycles Today"
+    id: pump_cycles_today
+    accuracy_decimals: 0
+    lambda: 'return id(pump_start_count);'
+    update_interval: 60s
+    
+  - platform: template
+    name: "${friendly_name} Pump Total Runtime Hours"
+    id: pump_runtime_hours
+    unit_of_measurement: "h"
+    accuracy_decimals: 1
+    lambda: 'return id(total_pump_runtime) / 3600000.0;'
+    update_interval: 60s
+    
+  - platform: template
+    name: "${friendly_name} Gallons Per Pump Cycle"
+    id: gallons_per_cycle
+    unit_of_measurement: "gal"
+    accuracy_decimals: 1
+    lambda: |-
+      static float last_total = 0;
+      static bool last_pump_state = false;
+      
+      bool pump_on = id(pump_running).state;
+      float current_total = id(water_total_gallons).state;
+      
+      if (!last_pump_state && pump_on) {
+        float gallons_used = current_total - last_total;
+        last_total = current_total;
+        last_pump_state = true;
+        return gallons_used;
+      } else if (last_pump_state && !pump_on) {
+        last_pump_state = false;
+      }
+      
+      return id(gallons_per_cycle).state;
+    update_interval: 2s
+
+  # WiFi signal
+  - platform: wifi_signal
+    name: "${friendly_name} WiFi Signal"
+    update_interval: 60s
+
+  # Uptime
+  - platform: uptime
+    name: "${friendly_name} Uptime"
+    update_interval: 60s
+
+# ============================================
+# BINARY SENSORS
+# ============================================
+
+binary_sensor:
+  # Leak detection
+  - platform: gpio
+    pin:
+      number: GPIO26
+      mode: INPUT_PULLUP
+      inverted: true
+    name: "${friendly_name} Leak Detected"
+    id: leak_sensor
+    device_class: moisture
+    filters:
+      - delayed_on: 500ms
+    on_press:
+      then:
+        - switch.turn_off: main_valve
+        - logger.log:
+            level: ERROR
+            format: "LEAK DETECTED - Valve closed automatically"
+
+  # Pump running detection
+  - platform: template
+    name: "${friendly_name} Pump Running"
+    id: pump_running
+    lambda: |-
+      return id(pump_current).state > 1.0;  # Adjust threshold
+    on_press:
+      then:
+        - globals.set:
+            id: pump_start_count
+            value: !lambda 'return id(pump_start_count) + 1;'
+        - globals.set:
+            id: last_pump_start
+            value: !lambda 'return millis();'
+    on_release:
+      then:
+        - globals.set:
+            id: total_pump_runtime
+            value: !lambda 'return id(total_pump_runtime) + (millis() - id(last_pump_start));'
+
+  # Alert: Filter needs replacement
+  - platform: template
+    name: "${friendly_name} Filter Replacement Needed"
+    id: filter_clogged
+    device_class: problem
+    lambda: |-
+      return id(filter_pressure_drop).state > 20.0;
+
+  # Alert: Scalding risk
+  - platform: template
+    name: "${friendly_name} Scalding Risk"
+    device_class: problem
+    lambda: |-
+      return id(hot_water_temp).state > 125.0;
+
+  # Alert: High TDS
+  - platform: template
+    name: "${friendly_name} High TDS Alert"
+    device_class: problem
+    lambda: |-
+      return id(water_tds).state > 500;
+
+  # Alert: pH out of range
+  - platform: template
+    name: "${friendly_name} pH Out of Range"
+    device_class: problem
+    lambda: |-
+      float ph = id(water_ph).state;
+      return ph < 6.5 || ph > 8.5;
+
+  # Alert: Pressure tank waterlogged
+  - platform: template
+    name: "${friendly_name} Pressure Tank Waterlogged"
+    device_class: problem
+    lambda: |-
+      return id(gallons_per_cycle).state < 1.0 && id(gallons_per_cycle).state > 0;
+
+  # Alert: Low pump output
+  - platform: template
+    name: "${friendly_name} Low Pump Pressure"
+    device_class: problem
+    lambda: |-
+      return id(pump_running).state && id(pump_output_pressure).state < 40.0;
+
+  # Connection status
+  - platform: status
+    name: "${friendly_name} Status"
+
+# ============================================
+# SWITCHES
+# ============================================
+
+switch:
+  # Main water valve control
+  - platform: gpio
+    pin: GPIO25
+    name: "${friendly_name} Main Valve"
+    id: main_valve
+    icon: "mdi:pipe-valve"
+    restore_mode: RESTORE_DEFAULT_OFF  # Fail-safe: closed on boot
+    
+    on_turn_on:
+      - delay: 5s
+      - logger.log: "Main valve opened"
+    
+    on_turn_off:
+      - delay: 5s
+      - logger.log: "Main valve closed"
+
+# ============================================
+# GLOBAL VARIABLES
+# ============================================
+
+globals:
+  - id: pump_start_count
+    type: int
+    restore_value: yes
+    initial_value: '0'
+    
+  - id: total_pump_runtime
+    type: unsigned long
+    restore_value: yes
+    initial_value: '0'
+    
+  - id: last_pump_start
+    type: unsigned long
+    restore_value: no
+    initial_value: '0'
+
+# ============================================
+# TIME & AUTOMATIONS
+# ============================================
+
+time:
+  - platform: homeassistant
+    id: homeassistant_time
+    # Reset daily pump cycle counter at midnight
+    on_time:
+      - seconds: 0
+        minutes: 0
+        hours: 0
+        then:
+          - globals.set:
+              id: pump_start_count
+              value: '0'
+
+# Continuous flow timeout automation
+interval:
+  - interval: 60s
+    then:
+      - lambda: |-
+          float flow = id(water_flow_rate).state;
+          static unsigned long last_flow_time = 0;
+          
+          // Alert if flow > 5 L/min continuously for 30+ minutes
+          if (flow > 5.0) {
+            if (last_flow_time == 0) {
+              last_flow_time = millis();
+            } else if (millis() - last_flow_time > 1800000) {
+              // 30 minutes of continuous flow - possible leak
+              id(main_valve).turn_off();
+              ESP_LOGE("automation", "Continuous flow timeout - valve closed");
+              last_flow_time = 0;
+            }
+          } else {
+            last_flow_time = 0;
+          }
+
+# ============================================
+# SERVICES (callable from Home Assistant)
+# ============================================
+
+api:
+  services:
+    # Reset water meter total
+    - service: reset_water_total
+      variables:
+        new_total: float
+      then:
+        - pulse_meter.set_total_pulses:
+            id: water_flow_rate
+            value: !lambda 'return new_total * 660;'  # Convert L to pulses
+        - logger.log:
+            format: "Water total reset to %.1f liters"
+            args: ['new_total']
+    
+    # Reset pump runtime counters
+    - service: reset_pump_runtime
+      then:
+        - globals.set:
+            id: total_pump_runtime
+            value: '0'
+        - logger.log: "Pump runtime counter reset"
+    
+    # Manual leak alert clear
+    - service: clear_leak_alert
+      then:
+        - logger.log: "Leak alert manually cleared"
+```
+
+---
