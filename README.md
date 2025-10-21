@@ -1,6 +1,3 @@
-# water-system-monitor
-monitoring a home's water system with ESP32 and sensors
-
 # ESP32 Well Water Monitoring System - Complete Build Plan
 
 ## System Overview
