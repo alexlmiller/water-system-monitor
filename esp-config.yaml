@@ -22,6 +22,32 @@ logger:
 api:
   encryption:
     key: !secret api_encryption_key
+  # Services section moved to end to avoid duplication
+  services:
+    # Reset water meter total
+    - service: reset_water_total
+      variables:
+        new_total: float
+      then:
+        - pulse_meter.set_total_pulses:
+            id: water_flow_rate
+            value: !lambda 'return new_total * 660;'  # Convert L to pulses
+        - logger.log:
+            format: "Water total reset to %.1f liters"
+            args: ['new_total']
+    
+    # Reset pump runtime counters
+    - service: reset_pump_runtime
+      then:
+        - globals.set:
+            id: total_pump_runtime
+            value: '0'
+        - logger.log: "Pump runtime counter reset"
+    
+    # Manual leak alert clear
+    - service: clear_leak_alert
+      then:
+        - logger.log: "Leak alert manually cleared"
 
 ota:
   password: !secret ota_password
@@ -30,6 +56,7 @@ web_server:
   port: 80
 
 # I2C for ADS1115 pressure sensor ADC
+# NOTE: GPIO21 (SDA) and GPIO22 (SCL) are standard I2C pins on ESP32
 i2c:
   sda: GPIO21
   scl: GPIO22
@@ -37,9 +64,10 @@ i2c:
   id: i2c_bus
 
 # 1-Wire for DS18B20 temperature sensors
-one_wire:
-  - platform: gpio
-    pin: GPIO22
+# NOTE: Moved to GPIO23 to avoid conflict with I2C
+dallas:
+  - pin: GPIO23
+    update_interval: 60s
 
 # ============================================
 # SENSORS
@@ -48,9 +76,10 @@ one_wire:
 sensor:
   # ------------------------------
   # FLOW MONITORING
+  # NOTE: Moved to GPIO4 to avoid conflict with I2C
   # ------------------------------
   - platform: pulse_meter
-    pin: GPIO21
+    pin: GPIO4
     name: "${friendly_name} Flow Rate"
     id: water_flow_rate
     unit_of_measurement: "L/min"
@@ -100,14 +129,10 @@ sensor:
   # PRESSURE MONITORING (via ADS1115)
   # ------------------------------
   - platform: ads1115
-    id: ads1115_hub
-    address: 0x48
-    
-  - platform: ads1115
     name: "${friendly_name} Pump Output Pressure"
     id: pump_output_pressure
-    ads1115_id: ads1115_hub
-    multiplexer: 'A0'
+    address: 0x48
+    multiplexer: 'A0_GND'
     gain: 4.096
     unit_of_measurement: "PSI"
     device_class: pressure
@@ -126,8 +151,8 @@ sensor:
   - platform: ads1115
     name: "${friendly_name} System Pressure"
     id: system_pressure
-    ads1115_id: ads1115_hub
-    multiplexer: 'A1'
+    address: 0x48
+    multiplexer: 'A1_GND'
     gain: 4.096
     unit_of_measurement: "PSI"
     device_class: pressure
@@ -145,8 +170,8 @@ sensor:
   - platform: ads1115
     name: "${friendly_name} Filtered Pressure"
     id: filter_outlet_pressure
-    ads1115_id: ads1115_hub
-    multiplexer: 'A2'
+    address: 0x48
+    multiplexer: 'A2_GND'
     gain: 4.096
     unit_of_measurement: "PSI"
     device_class: pressure
@@ -578,6 +603,56 @@ switch:
       - logger.log: "Pump interlock engaged - pump disabled"
 
 # ============================================
+# OUTPUTS (for status LEDs)
+# ============================================
+
+output:
+  - platform: gpio
+    pin: GPIO16
+    id: valve_open_led_output
+    
+  - platform: gpio
+    pin: GPIO17
+    id: valve_closed_led_output
+    
+  - platform: gpio
+    pin: GPIO18
+    id: pump_enabled_led_output
+    
+  - platform: gpio
+    pin: GPIO19
+    id: leak_alert_led_output
+
+# ============================================
+# LIGHTS (for easier LED control)
+# ============================================
+
+light:
+  - platform: binary
+    name: "${friendly_name} Valve Open LED"
+    id: valve_open_led
+    output: valve_open_led_output
+    internal: true
+    
+  - platform: binary
+    name: "${friendly_name} Valve Closed LED"
+    id: valve_closed_led
+    output: valve_closed_led_output
+    internal: true
+    
+  - platform: binary
+    name: "${friendly_name} Pump Enabled LED"
+    id: pump_enabled_led
+    output: pump_enabled_led_output
+    internal: true
+    
+  - platform: binary
+    name: "${friendly_name} Leak Alert LED"
+    id: leak_alert_led
+    output: leak_alert_led_output
+    internal: true
+
+# ============================================
 # GLOBAL VARIABLES
 # ============================================
 
@@ -677,36 +752,3 @@ interval:
           } else {
             id(leak_alert_led).turn_off();
           }
-
-# ============================================
-# SERVICES (callable from Home Assistant)
-# ============================================
-
-api:
-  services:
-    # Reset water meter total
-    - service: reset_water_total
-      variables:
-        new_total: float
-      then:
-        - pulse_meter.set_total_pulses:
-            id: water_flow_rate
-            value: !lambda 'return new_total * 660;'  # Convert L to pulses
-        - logger.log:
-            format: "Water total reset to %.1f liters"
-            args: ['new_total']
-    
-    # Reset pump runtime counters
-    - service: reset_pump_runtime
-      then:
-        - globals.set:
-            id: total_pump_runtime
-            value: '0'
-        - logger.log: "Pump runtime counter reset"
-    
-    # Manual leak alert clear
-    - service: clear_leak_alert
-      then:
-        - logger.log: "Leak alert manually cleared"
-```
-
