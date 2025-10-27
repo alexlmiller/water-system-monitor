@@ -413,7 +413,174 @@ When GPIO27 LOW: Relay open, pump disabled
 
 ---
 
-This document provides everything needed to build and deploy the system. Review with your knowledgeable friends, then proceed with hardware assembly and testing.
+## Important Safety Logic & Design Decisions
+
+### Leak Detection Interlock
+The valve **cannot be opened** while the leak sensor detects water. This prevents accidentally flooding after a leak event. To reopen the valve:
+1. Fix the leak source
+2. Dry the leak sensor completely
+3. Verify sensor shows "dry" in Home Assistant
+4. Then open the valve from HA
+
+If the valve immediately closes again after opening, the sensor is still detecting moisture.
+
+### Continuous Flow Alert (Not Auto-Shutoff)
+The system monitors for continuous flow >5 L/min for 30+ minutes and **alerts only** - it does NOT automatically close the valve. This prevents false shutoffs during legitimate high water use like:
+- Filling a hot tub or pool
+- Running lawn sprinklers for extended periods
+- Multiple showers/laundry running simultaneously
+
+**Recommended Home Assistant automation:**
+```yaml
+automation:
+  - alias: "Water - Continuous Flow Alert"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.well_water_system_continuous_flow_alert
+        to: "on"
+    action:
+      - service: notify.mobile_app
+        data:
+          title: "High Water Usage Alert"
+          message: "Water has been flowing continuously for 30+ minutes at high rate. Check for leaks or forgotten fixtures."
+      # Optional: Auto-close only when away
+      # - condition: state
+      #   entity_id: input_boolean.away_mode
+      #   state: "on"
+      # - service: switch.turn_off
+      #   entity_id: switch.well_water_system_main_valve
+```
+
+### Filter Pressure Drop - Flow Compensation
+The filter alert only triggers when flow is low (<2 L/min) AND pressure drop is high (>15 PSI). During high flow, pressure drop is normal and expected. The 15 PSI threshold is conservative - adjust based on your filter specifications after observing normal operation.
+
+### Pump Alerts - Time Delays
+- **Low Pump Pressure**: Requires 10 seconds of sustained low pressure to avoid transient alerts during pump startup
+- **Pressure Tank Issues**: Counts short cycles over 24 hours (>5 cycles < 1 gallon) rather than alerting on single occurrences
+
+### Debug vs Production Logging
+- **During setup**: Set `logger: level: DEBUG` to see DS18B20 addresses, raw sensor values, and detailed operation
+- **Production**: Use `level: INFO` or `WARN` to reduce log spam while keeping important events (valve operations, leak alerts)
+
+## Installation Notes
+
+### Sensor Locations
+- **Pump output pressure**: Before pressure tank (cut pipe, add tee)
+- **System pressure**: After tank, before filter (may have test port)
+- **Filtered pressure**: After filter (may have test port)
+- **Incoming temp**: Strap to incoming cold water line with thermal paste
+- **Hot water temp**: Strap to hot water outlet with thermal paste
+- **TDS/pH**: After filtration, in tee or inline chamber
+- **Current sensor**: Clamp around pump power wire (HOT wire only)
+- **Leak sensor**: Center of mechanical room floor, lowest point
+
+### Motorized Valve Location
+**Install valve AFTER pressure tank** for these reasons:
+- ✅ No risk of pump deadheading
+- ✅ Standard industry configuration
+- ✅ Mechanical room leak sensor catches tank/inlet failures
+- ✅ Manual valve before tank already exists for service
+- ✅ Pump interlock provides redundant protection
+
+### Pump Interlock Installation
+**CRITICAL - Licensed Electrician Required for 240V Work**
+
+1. **Locate pump control box** (usually near pressure tank)
+2. **Identify pump circuit**: 240V from breaker → pressure switch → pump
+3. **Install SSR/Contactor**: Insert in line between pressure switch and pump
+4. **Control wiring**: Run low-voltage wire from ESP32 enclosure to pump box
+5. **Test thoroughly**: Verify pump only runs when GPIO27 is HIGH
+6. **Label clearly**: "AUTOMATED INTERLOCK - DO NOT BYPASS"
+
+**Safety checklist:**
+- [ ] All 240V connections in approved junction boxes
+- [ ] Proper wire gauge for pump amperage
+- [ ] Strain reliefs on all connections
+- [ ] Ground bonding verified
+- [ ] Cover plates secured
+- [ ] Licensed electrician inspection
+
+### Control Panel Assembly
+
+**Enclosure top panel layout:**
+```
+┌─────────────────────────────────────────────┐
+│                                             │
+│   MODE: [AUTO  ●  MANUAL]  Toggle Switch   │
+│                                             │
+│   MANUAL: [OPEN] [CLOSE]   Pushbuttons     │
+│                                             │
+│   STATUS:  ●Open  ○Closed  ●Pump  ○Leak    │
+│           LEDs   LEDs      LED    LED       │
+│                                             │
+└─────────────────────────────────────────────┘
+```
+
+**Drilling template:**
+- Toggle switch: 12mm hole
+- Pushbuttons: 16mm holes  
+- LEDs: 12mm holes
+- Space components 1" apart minimum
+
+**Panel materials:**
+- Polycarbonate or ABS plastic panel
+- Mount on hinges for access to interior
+- Use rubber grommets for all holes
+- Label with permanent marker or label maker
+
+### Critical Safety
+- GFCI protection required for all AC power
+- Use cable glands for all enclosure penetrations
+- Install flyback and TVS diodes on motorized valve
+- Keep 240V wiring in separate conduit from low voltage
+- Label all wiring clearly
+- Test ground continuity on all metal parts
+
+### First Boot Procedure
+1. **Flash ESPHome via USB** first time
+2. **Check logs** for DS18B20 addresses, update YAML with actual addresses
+3. **Verify all sensors** reading reasonable values in logs
+4. **Test valve operation** (should be closed on boot, pump interlock off)
+5. **Test control panel:**
+   - Verify all LEDs illuminate correctly
+   - Test AUTO mode - valve control from Home Assistant works
+   - Test MANUAL mode - toggle switch, both buttons function
+   - Verify mode switch prevents HA control in manual mode
+6. **Test leak sensor** triggers valve AND pump interlock
+7. **Calibrate all sensors** per procedures below
+8. **Monitor for 24 hours** before relying on automation
+
+### Control Panel Testing Sequence
+1. **Power on in AUTO mode** (toggle switch to AUTO position)
+   - Valve Closed LED should be ON (red)
+   - Pump Enabled LED should be OFF
+   - Open valve from Home Assistant
+   - Verify Valve Open LED turns ON (green), Closed LED turns OFF
+   - Verify Pump Enabled LED turns ON (green)
+
+2. **Switch to MANUAL mode**
+   - Toggle switch to MANUAL position
+   - Press OPEN button
+   - Verify valve opens, LEDs update
+   - Press CLOSE button
+   - Verify valve closes, LEDs update
+   - Try to control valve from Home Assistant - should not work in MANUAL mode
+
+3. **Test leak interlock**
+   - Trigger leak sensor (short to ground)
+   - Verify Leak Alert LED blinks
+   - Verify valve closes automatically
+   - Verify Pump Enabled LED turns OFF
+   - Try to open valve (both manual and HA) - should be blocked
+   - Remove leak sensor trigger
+   - Verify can now open valve
+
+4. **Return to AUTO mode**
+   - Toggle switch back to AUTO
+   - Verify Home Assistant control works
+   - Test pump interlock follows valve state
+
+---------
 
 ## Revision History
 
