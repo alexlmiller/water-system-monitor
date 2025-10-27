@@ -86,6 +86,20 @@ This system monitors and controls a residential well water system with pressure 
 |------|-----|------------|-------|-------|
 | Water Leak Sensor | 1 | $4 | $4 | Simple probe type |
 
+### Physical Control Panel
+| Item | Qty | Unit Price | Total | Notes |
+|------|-----|------------|-------|-------|
+| SPDT Toggle Switch | 1 | $4 | $4 | Auto/Manual mode |
+| Momentary Pushbuttons 16mm | 2 | $5 | $10 | Illuminated preferred |
+| Panel Mount LEDs 12mm | 4 | $1.50 | $6 | 2x Green, 2x Red |
+| 220Ω Resistors 1/4W | 4 | $0.10 | $0.40 | LED current limiting |
+
+### Pump Interlock
+| Item | Qty | Unit Price | Total | Notes |
+|------|-----|------------|-------|-------|
+| 30A Solid State Relay | 1 | $15 | $15 | Fotek SSR-40DA or similar |
+| OR: 30A Contactor 240V | 1 | $20 | $20 | Siemens 3TH4031-0A |
+
 ### Miscellaneous
 | Item | Qty | Unit Price | Total | Notes |
 |------|-----|------------|-------|-------|
@@ -99,7 +113,7 @@ This system monitors and controls a residential well water system with pressure 
 | Terminal Blocks 2.5mm² | 15 | $0.50 | $7.50 | Connections |
 | Wire 18AWG/22AWG | - | $8 | $8 | Power and signal |
 
-**Total System Cost: $278**
+**Total System Cost: $313** (with SSR) **or $318** (with contactor)
 
 ---
 
@@ -112,8 +126,9 @@ Flow Meter:
 Temperature Sensors (1-Wire):
   GPIO22 - DS18B20 data line (with 4.7kΩ pull-up to 3.3V)
 
-Valve Control:
-  GPIO25 - Relay control output
+Valve & Pump Control:
+  GPIO25 - Main valve relay control
+  GPIO27 - Pump interlock relay control
 
 Leak Detection:
   GPIO26 - Water leak sensor (INPUT_PULLUP)
@@ -126,9 +141,20 @@ Water Quality:
   GPIO35 - pH sensor analog input
 
 Pressure Sensors (I2C via ADS1115):
-  GPIO21 (SDA) - I2C data
-  GPIO22 (SCL) - I2C clock
+  GPIO21 (SDA) - I2C data (shared with flow meter pin)
+  GPIO22 (SCL) - I2C clock (shared with 1-Wire pin)
   Note: ADS1115 channels A0, A1, A2 for 3 pressure sensors
+
+Physical Control Panel Inputs:
+  GPIO15 - Auto/Manual mode toggle switch (INPUT_PULLUP)
+  GPIO14 - Manual Open pushbutton (INPUT_PULLUP)
+  GPIO12 - Manual Close pushbutton (INPUT_PULLUP)
+
+Status Indicator LEDs:
+  GPIO16 - Valve Open LED (Green)
+  GPIO17 - Valve Closed LED (Red)
+  GPIO18 - Pump Enabled LED (Green)
+  GPIO19 - Leak Alert LED (Red)
 
 Spare:
   GPIO4 - Future expansion (turbidity sensor, etc.)
@@ -225,85 +251,134 @@ VCC        ────→    3.3V
 Signal     ────→    GPIO26 (INPUT_PULLUP mode)
 ```
 
----
+### Physical Control Panel
 
-## Calibration Procedures
+**Mode Toggle Switch:**
+```
+SPDT Toggle         ESP32
+Common     ────→    GPIO15
+Position 1 ────→    GND (Manual mode)
+Position 2 ────→    No connection (Auto mode - pulled HIGH)
+```
 
-### Flow Meter Calibration
-1. Fill a precise 10-liter container while monitoring ESPHome logs
-2. Note total pulse count from logs
-3. Calculate: `actual_pulses_per_liter = total_pulses / 10`
-4. Update YAML multiplier: `multiply: 60 / actual_pulses_per_liter`
-5. Reflash ESP32
+**Pushbuttons:**
+```
+Momentary Button    ESP32
+Open Button:
+  Pin 1      ────→  GPIO14
+  Pin 2      ────→  GND
 
-### Pressure Sensor Calibration
-1. Verify sensors read atmospheric pressure (~0 PSI) when disconnected
-2. With pump running, compare readings to mechanical gauge
-3. Adjust `calibrate_linear` values if needed
+Close Button:
+  Pin 1      ────→  GPIO12
+  Pin 2      ────→  GND
 
-### pH Sensor Calibration
-1. Rinse probe with distilled water
-2. Immerse in pH 7.0 buffer, wait 2 minutes, note voltage
-3. Immerse in pH 4.0 buffer, wait 2 minutes, note voltage
-4. Update `calibrate_linear` values in YAML
-5. Recalibrate monthly
+Note: Both use INPUT_PULLUP, so button press pulls pin LOW
+```
 
-### TDS Sensor Calibration
-1. Use calibration solution (usually 342 ppm or 1413 µS/cm)
-2. Immerse sensor, note voltage reading
-3. Adjust `calibrate_linear` values accordingly
+**Status LEDs (all 4 wired identically):**
+```
+ESP32 GPIO → 220Ω Resistor → LED Anode (+)
+                              LED Cathode (-) → GND
 
-### Current Sensor Calibration
-1. Measure actual pump current with clamp meter
-2. Compare to ESPHome reading
-3. Adjust `calibrate_linear` values to match
+GPIO16 → 220Ω → Green LED (Valve Open)
+GPIO17 → 220Ω → Red LED (Valve Closed)
+GPIO18 → 220Ω → Green LED (Pump Enabled)
+GPIO19 → 220Ω → Red LED (Leak Alert)
+```
 
----
+### Pump Interlock Relay
 
-## Installation Notes
+**Control Side:**
+```
+Solid State Relay   ESP32 / Power
+DC+ (Control)  ────→ GPIO27
+DC- (Control)  ────→ GND
+```
 
-### Sensor Locations
-- **Pump output pressure**: Before pressure tank (cut pipe, add tee)
-- **System pressure**: After tank, before filter (may have test port)
-- **Filtered pressure**: After filter (may have test port)
-- **Incoming temp**: Strap to incoming cold water line with thermal paste
-- **Hot water temp**: Strap to hot water outlet with thermal paste
-- **TDS/pH**: After filtration, in tee or inline chamber
-- **Current sensor**: Clamp around pump power wire (HOT)
-- **Leak sensor**: Center of mechanical room floor
+**Power Side (240V - IN PUMP CONTROL BOX):**
+```
+240V Circuit Breaker
+       │
+       ├────→ Relay Input (+)
+       │      
+       └────→ Pressure Switch → Relay Output (+) → Pump Hot
+       
+Neutral: Direct to pump (not through relay)
+Ground: Direct to pump
 
-### Critical Safety
-- GFCI protection required for all AC power
-- Use cable glands for all enclosure penetrations
-- Install flyback and TVS diodes on motorized valve
-- Keep electronics away from potential water spray
-- Label all wiring clearly
+When GPIO27 HIGH: Relay conducts, pump can run
+When GPIO27 LOW: Relay open, pump disabled
+```
 
-### First Boot Procedure
-1. Flash ESPHome via USB first time
-2. Check logs for DS18B20 addresses, update YAML
-3. Verify all sensors reading reasonable values
-4. Test valve operation (should close on boot)
-5. Calibrate all sensors
-6. Test leak sensor triggers valve
-7. Monitor for 24 hours before relying on automation
-
----
-
-## Home Assistant Integration
-
-After ESPHome device is online, it will automatically appear in Home Assistant. Create automations for:
-
-- **Filter replacement reminder** (pressure drop > 20 PSI)
-- **Vacation mode** (close valve when away)
-- **Leak alerts** (push notifications)
-- **Water quality alerts** (TDS/pH out of range)
-- **Pump maintenance** (runtime hours threshold)
-- **Energy dashboard** (water usage tracking)
+**CRITICAL SAFETY:** 
+- Install pump relay in existing pump control box
+- Use strain reliefs on all 240V connections
+- Verify all connections with licensed electrician
+- Label clearly: "AUTOMATED INTERLOCK - DO NOT BYPASS"
 
 ---
 
 ## Troubleshooting
+
+**Control panel not responding:**
+- Verify toggle switch wiring (common to GPIO15, one position to GND)
+- Check pushbutton connections (one side to GPIO, other to GND)
+- Verify INPUT_PULLUP working (pins should read HIGH when not pressed)
+- Check logs for button press events when testing
+
+**LEDs not lighting:**
+- Verify 220Ω resistors installed on each LED
+- Check LED polarity (long leg = anode/+, short leg = cathode/-)
+- Test LED directly with 3.3V and resistor
+- Verify GPIO pins not used elsewhere
+- Check interval is running (should update every 500ms)
+
+**Valve won't open in MANUAL mode:**
+- Check leak sensor not detecting water
+- Verify toggle switch in MANUAL position (GPIO15 reads LOW)
+- Check logs for "Manual OPEN command" message
+- Test valve opens from Home Assistant in AUTO mode
+
+**Buttons work in AUTO mode (shouldn't):**
+- Verify toggle switch wiring correct
+- Check lambda condition checking `manual_mode_switch` state
+- Review logs to confirm mode switch state
+
+**Pump runs with valve closed:**
+- Check pump interlock relay wiring
+- Verify GPIO27 follows valve state (HIGH=open, LOW=closed)
+- Test relay manually - should click when GPIO27 changes
+- Check pump control box wiring to relay
+
+**Pump won't run with valve open:**
+- Verify pump interlock relay energized (GPIO27 HIGH)
+- Check SSR/contactor control voltage present
+- Verify pressure switch working (manual test)
+- Check relay output connections to pump
+
+**Leak alert LED not blinking:**
+- Verify leak sensor triggering (check logs)
+- Test leak sensor with wire to GND
+- Check LED wiring and resistor
+- Verify interval running (should blink at 500ms)
+
+**Valve won't open after leak:**
+- Check leak sensor shows "dry" in Home Assistant
+- Sensor may need time to fully dry (use fan/towel)
+- Check logs for "Cannot open valve - leak still detected!" message
+- Temporarily unplug sensor if emergency access needed (not recommended)
+
+**Continuous flow alert triggering during normal use:**
+- This is informational - no auto-shutoff occurs
+- Adjust threshold in YAML if needed (currently 5 L/min for 30 min)
+- Create Home Assistant automation for your preferred handling
+- Consider "away mode" condition for auto-shutoff
+
+**Filter alert too sensitive:**
+- Adjust threshold from 15 PSI to higher (20-25 PSI)
+- Verify alert only triggers during low flow (<2 L/min)
+- Check actual pressure drop with mechanical gauge
+- Some filters naturally have higher drop when new
 
 **Flow meter reads zero:**
 - Check 10kΩ pull-up resistor
@@ -318,7 +393,7 @@ After ESPHome device is online, it will automatically appear in Home Assistant. 
 **Temperature sensors not found:**
 - Check 4.7kΩ pull-up resistor
 - Verify DS18B20 wiring (VCC=5V, not 3.3V recommended)
-- Look in logs for addresses
+- Look in logs for addresses (set logger to DEBUG)
 
 **pH/TDS readings erratic:**
 - Calibrate sensors
@@ -331,6 +406,23 @@ After ESPHome device is online, it will automatically appear in Home Assistant. 
 - Check burden resistor (33Ω)
 - Ensure correct orientation of CT clamp
 
+**Short cycle alerts when tank is fine:**
+- This counts cycles over 24 hours (>5 short cycles)
+- Single short cycle is normal and won't alert
+- Adjust threshold if you have small fixtures causing micro-cycles
+
 ---
 
 This document provides everything needed to build and deploy the system. Review with your knowledgeable friends, then proceed with hardware assembly and testing.
+
+## Revision History
+
+**Version 1.1** - Incorporated engineer feedback:
+- Added leak sensor interlock to prevent valve opening during leak
+- Changed continuous flow from auto-shutoff to alert-only (prevents false shutoffs during legitimate high use)
+- Added flow condition to filter pressure drop alert (only alerts during low/no flow)
+- Added time delays to pump pressure alerts (reduces transient false alerts)
+- Improved pressure tank alert to count cycles over 24 hours instead of single occurrence
+- Added proper globals for state tracking instead of static variables
+- Enhanced Home Assistant integration examples with actionable notification automation
+- Expanded troubleshooting section with new logic explanations
