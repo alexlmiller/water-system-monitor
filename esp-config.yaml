@@ -16,7 +16,8 @@ wifi:
     password: !secret ap_password
 
 logger:
-  level: INFO
+  level: INFO  # Set to DEBUG during initial setup to see DS18B20 addresses and raw values
+               # Return to INFO or WARN for production to reduce log volume
 
 api:
   encryption:
@@ -316,25 +317,95 @@ sensor:
 # ============================================
 
 binary_sensor:
-  # Leak detection
+  # ------------------------------
+  # PHYSICAL CONTROL PANEL
+  # ------------------------------
+  - platform: gpio
+    pin:
+      number: GPIO15
+      mode: INPUT_PULLUP
+      inverted: true
+    name: "${friendly_name} Manual Mode"
+    id: manual_mode_switch
+    filters:
+      - delayed_on: 50ms
+      - delayed_off: 50ms
+    on_press:
+      - logger.log: "Switched to MANUAL mode"
+    on_release:
+      - logger.log: "Switched to AUTO mode"
+      
+  - platform: gpio
+    pin:
+      number: GPIO14
+      mode: INPUT_PULLUP
+      inverted: true
+    name: "${friendly_name} Manual Open Button"
+    id: manual_open_button
+    internal: true  # Don't expose to HA
+    filters:
+      - delayed_on: 50ms
+    on_press:
+      - if:
+          condition:
+            binary_sensor.is_on: manual_mode_switch
+          then:
+            - switch.turn_on: main_valve
+            - logger.log: "Manual OPEN command"
+          else:
+            - logger.log: "Ignoring button - system in AUTO mode"
+          
+  - platform: gpio
+    pin:
+      number: GPIO12
+      mode: INPUT_PULLUP
+      inverted: true
+    name: "${friendly_name} Manual Close Button"
+    id: manual_close_button
+    internal: true
+    filters:
+      - delayed_on: 50ms
+    on_press:
+      - if:
+          condition:
+            binary_sensor.is_on: manual_mode_switch
+          then:
+            - switch.turn_off: main_valve
+            - logger.log: "Manual CLOSE command"
+          else:
+            - logger.log: "Ignoring button - system in AUTO mode"
+
+  # ------------------------------
+  # LEAK DETECTION
+  # ------------------------------
   - platform: gpio
     pin:
       number: GPIO26
       mode: INPUT_PULLUP
       inverted: true
-    name: "${friendly_name} Leak Detected"
+    name: "${friendly_name} Mechanical Room Leak"
     id: leak_sensor
     device_class: moisture
     filters:
       - delayed_on: 500ms
     on_press:
       then:
+        # Close valve immediately
         - switch.turn_off: main_valve
         - logger.log:
             level: ERROR
-            format: "LEAK DETECTED - Valve closed automatically"
+            format: "LEAK DETECTED - Valve closed"
+        # Wait for current pump cycle to complete
+        - delay: 30s
+        # Disable pump interlock
+        - switch.turn_off: pump_interlock_relay
+        - logger.log:
+            level: ERROR
+            format: "Pump disabled due to leak"
 
-  # Pump running detection
+  # ------------------------------
+  # PUMP MONITORING
+  # ------------------------------
   - platform: template
     name: "${friendly_name} Pump Running"
     id: pump_running
@@ -354,13 +425,20 @@ binary_sensor:
             id: total_pump_runtime
             value: !lambda 'return id(total_pump_runtime) + (millis() - id(last_pump_start));'
 
-  # Alert: Filter needs replacement
+  # Alert: Filter needs replacement (only when low/no flow)
   - platform: template
     name: "${friendly_name} Filter Replacement Needed"
     id: filter_clogged
     device_class: problem
     lambda: |-
-      return id(filter_pressure_drop).state > 20.0;
+      // Only alert if high pressure drop during low/no flow
+      // During high flow, pressure drop is normal
+      float drop = id(filter_pressure_drop).state;
+      float flow = id(water_flow_rate).state;
+      
+      // If flow < 2 L/min and pressure drop > 15 PSI, filter likely clogged
+      return (flow < 2.0 && drop > 15.0);
+    update_interval: 10s
 
   # Alert: Scalding risk
   - platform: template
@@ -384,19 +462,67 @@ binary_sensor:
       float ph = id(water_ph).state;
       return ph < 6.5 || ph > 8.5;
 
-  # Alert: Pressure tank waterlogged
+  # Alert: Pressure tank waterlogged (multiple short cycles)
   - platform: template
-    name: "${friendly_name} Pressure Tank Waterlogged"
+    name: "${friendly_name} Pressure Tank Issue"
     device_class: problem
     lambda: |-
-      return id(gallons_per_cycle).state < 1.0 && id(gallons_per_cycle).state > 0;
+      // Track short cycles over time instead of alerting on single occurrence
+      float gallons = id(gallons_per_cycle).state;
+      
+      // Reset counter daily
+      if (millis() - id(short_cycle_reset_time) > 86400000) {
+        id(short_cycle_count) = 0;
+        id(short_cycle_reset_time) = millis();
+      }
+      
+      // Increment counter for short cycles
+      if (gallons < 1.0 && gallons > 0.1) {
+        id(short_cycle_count) = id(short_cycle_count) + 1;
+      }
+      
+      // Alert if more than 5 short cycles in 24 hours
+      return id(short_cycle_count) > 5;
+    update_interval: 60s
 
-  # Alert: Low pump output
+  # Alert: Low pump output (with time delay to avoid transients)
   - platform: template
     name: "${friendly_name} Low Pump Pressure"
     device_class: problem
     lambda: |-
-      return id(pump_running).state && id(pump_output_pressure).state < 40.0;
+      static unsigned long low_pressure_start = 0;
+      bool pump_on = id(pump_running).state;
+      float pressure = id(pump_output_pressure).state;
+      
+      if (pump_on && pressure < 40.0) {
+        if (low_pressure_start == 0) low_pressure_start = millis();
+        // Alert only if low pressure persists for 10+ seconds
+        return (millis() - low_pressure_start) > 10000;
+      } else {
+        low_pressure_start = 0;
+        return false;
+      }
+    update_interval: 5s
+
+  # Alert: Continuous high flow (alert only, doesn't close valve)
+  - platform: template
+    name: "${friendly_name} Continuous Flow Alert"
+    id: continuous_flow_alert
+    device_class: problem
+    lambda: |-
+      float flow = id(water_flow_rate).state;
+      
+      if (flow > 5.0) {
+        if (id(continuous_flow_start) == 0) {
+          id(continuous_flow_start) = millis();
+        }
+        // Alert after 30 minutes of continuous flow > 5 L/min
+        return (millis() - id(continuous_flow_start)) > 1800000;
+      } else {
+        id(continuous_flow_start) = 0;
+        return false;
+      }
+    update_interval: 60s
 
   # Connection status
   - platform: status
@@ -407,7 +533,9 @@ binary_sensor:
 # ============================================
 
 switch:
-  # Main water valve control
+  # ------------------------------
+  # MAIN WATER VALVE CONTROL
+  # ------------------------------
   - platform: gpio
     pin: GPIO25
     name: "${friendly_name} Main Valve"
@@ -416,12 +544,38 @@ switch:
     restore_mode: RESTORE_DEFAULT_OFF  # Fail-safe: closed on boot
     
     on_turn_on:
-      - delay: 5s
-      - logger.log: "Main valve opened"
+      # Safety interlock: prevent opening if leak detected
+      - if:
+          condition:
+            binary_sensor.is_on: leak_sensor
+          then:
+            - switch.turn_off: main_valve
+            - logger.log:
+                level: ERROR
+                format: "Cannot open valve - leak still detected!"
+          else:
+            - delay: 5s
+            - switch.turn_on: pump_interlock_relay  # Enable pump
+            - logger.log: "Valve opened, pump enabled"
     
     on_turn_off:
       - delay: 5s
-      - logger.log: "Main valve closed"
+      - switch.turn_off: pump_interlock_relay  # Disable pump
+      - logger.log: "Valve closed, pump disabled"
+
+  # ------------------------------
+  # PUMP INTERLOCK RELAY
+  # ------------------------------
+  - platform: gpio
+    pin: GPIO27
+    name: "${friendly_name} Pump Interlock"
+    id: pump_interlock_relay
+    restore_mode: RESTORE_DEFAULT_OFF  # Pump disabled on boot (fail-safe)
+    icon: "mdi:pump"
+    on_turn_on:
+      - logger.log: "Pump interlock released - pump can run"
+    on_turn_off:
+      - logger.log: "Pump interlock engaged - pump disabled"
 
 # ============================================
 # GLOBAL VARIABLES
@@ -439,6 +593,21 @@ globals:
     initial_value: '0'
     
   - id: last_pump_start
+    type: unsigned long
+    restore_value: no
+    initial_value: '0'
+    
+  - id: continuous_flow_start
+    type: unsigned long
+    restore_value: no
+    initial_value: '0'
+    
+  - id: short_cycle_count
+    type: int
+    restore_value: no
+    initial_value: '0'
+    
+  - id: short_cycle_reset_time
     type: unsigned long
     restore_value: no
     initial_value: '0'
@@ -460,26 +629,53 @@ time:
               id: pump_start_count
               value: '0'
 
-# Continuous flow timeout automation
+# Monitoring automation (logging only, no auto-shutoff)
 interval:
   - interval: 60s
     then:
       - lambda: |-
+          // This just logs high flow for debugging
+          // Actual alerting is handled by continuous_flow_alert binary sensor
           float flow = id(water_flow_rate).state;
-          static unsigned long last_flow_time = 0;
           
-          // Alert if flow > 5 L/min continuously for 30+ minutes
-          if (flow > 5.0) {
-            if (last_flow_time == 0) {
-              last_flow_time = millis();
-            } else if (millis() - last_flow_time > 1800000) {
-              // 30 minutes of continuous flow - possible leak
-              id(main_valve).turn_off();
-              ESP_LOGE("automation", "Continuous flow timeout - valve closed");
-              last_flow_time = 0;
+          if (flow > 5.0 && (millis() - id(continuous_flow_start)) > 1800000) {
+            ESP_LOGW("automation", "High continuous flow detected for 30+ minutes: %.1f L/min", flow);
+            ESP_LOGW("automation", "Check continuous_flow_alert sensor and create HA automation for notifications");
+          }
+
+  # ------------------------------
+  # STATUS LED UPDATES
+  # ------------------------------
+  - interval: 500ms
+    then:
+      - lambda: |-
+          // Update valve status LEDs
+          if (id(main_valve).state) {
+            id(valve_open_led).turn_on();
+            id(valve_closed_led).turn_off();
+          } else {
+            id(valve_open_led).turn_off();
+            id(valve_closed_led).turn_on();
+          }
+          
+          // Update pump enabled LED
+          if (id(pump_interlock_relay).state) {
+            id(pump_enabled_led).turn_on();
+          } else {
+            id(pump_enabled_led).turn_off();
+          }
+          
+          // Update leak alert LED (blink if active)
+          static bool blink_state = false;
+          if (id(leak_sensor).state) {
+            blink_state = !blink_state;
+            if (blink_state) {
+              id(leak_alert_led).turn_on();
+            } else {
+              id(leak_alert_led).turn_off();
             }
           } else {
-            last_flow_time = 0;
+            id(leak_alert_led).turn_off();
           }
 
 # ============================================
@@ -514,4 +710,3 @@ api:
         - logger.log: "Leak alert manually cleared"
 ```
 
----
